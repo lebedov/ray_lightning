@@ -10,10 +10,10 @@ import torch
 from pytorch_lightning.accelerators import CPUAccelerator
 from pytorch_lightning.plugins import DDPSpawnPlugin
 from pytorch_lightning import _logger as log, LightningModule
+from pytorch_lightning.trainer.states import TrainerFn
 from pytorch_lightning.utilities import rank_zero_only
 
 import ray
-from ray.util import PublicAPI
 from ray.util.queue import Queue
 
 from ray_lightning.session import init_session
@@ -55,7 +55,6 @@ class RayExecutor:
         return fn(*args, **kwargs)
 
 
-@PublicAPI(stability="beta")
 class RayPlugin(DDPSpawnPlugin):
     """Pytorch Lightning plugin for DDP training on a Ray cluster.
 
@@ -131,13 +130,17 @@ class RayPlugin(DDPSpawnPlugin):
             num_gpus=int(self.use_gpu)).remote()
         return worker
 
-    def setup(self, model: LightningModule):
+    def setup(self):
         """Sets up PTL Trainer and creates the Ray actors."""
         # Check that trainer attribute has been set when this method is called.
-        self._model = model
         self.workers = [self._create_worker() for _ in range(self.num_workers)]
         if self.init_hook:
             ray.get([w.execute.remote(self.init_hook) for w in self.workers])
+     
+        # Sets environment variables for all workers.
+        self._setup_env_vars()
+
+        ray.get([w.execute.remote(self.init_dist_connection, g, self.num_workers) for g, w in zip(range(self.num_workers), self.workers)])
 
     def __getstate__(self):
         d = self.__dict__.copy()
@@ -187,14 +190,14 @@ class RayPlugin(DDPSpawnPlugin):
         worker and return."""
 
         # Sets environment variables for all workers.
-        self._setup_env_vars()
+        # self._setup_env_vars()
 
         self.global_to_local = self.get_local_ranks()
 
-        model = self._model
+        model = self.model
         model_ref = ray.put(model)
         # Don't pickle the model when training remotely.
-        self._model = None
+        self.model = None
 
         queue = None
         if tune_enabled and TUNE_INSTALLED and is_session_enabled():
@@ -213,8 +216,8 @@ class RayPlugin(DDPSpawnPlugin):
         state_dict = load_state_stream(state_stream, to_gpu=self.use_gpu)
         # Set the state for PTL using the output from remote training.
         self._results = results
-        self._model = model
-        self._model.load_state_dict(state_dict)
+        self.model = model
+        self.model.load_state_dict(state_dict)
         if self.lightning_module.trainer.checkpoint_callback:
             self.lightning_module.trainer.checkpoint_callback \
                 .best_model_path = best_path
@@ -232,15 +235,15 @@ class RayPlugin(DDPSpawnPlugin):
         if self.use_gpu and isinstance(current_accelerator, CPUAccelerator):
             from weakref import proxy
             from ray_lightning.util import DelayedGPUAccelerator
-            precision_plugin = current_accelerator.precision_plugin
             new_accelerator = DelayedGPUAccelerator(
-                precision_plugin=precision_plugin, training_type_plugin=self)
-            self.lightning_module.trainer.accelerator_connector\
+                precision_plugin=self.precision_plugin,
+                training_type_plugin=self)
+            self.lightning_module.trainer._accelerator_connector\
                 ._training_type_plugin = \
                 proxy(new_accelerator.training_type_plugin)
-            self.lightning_module.trainer.accelerator_connector\
-                ._precision_plugin = proxy(new_accelerator.precision_plugin)
-            self.lightning_module.trainer.accelerator_connector.accelerator \
+            self.lightning_module.trainer._accelerator_connector\
+                ._precision_plugin = proxy(self.precision_plugin)
+            self.lightning_module.trainer._accelerator_connector.accelerator \
                 = new_accelerator
 
     def start_training(self, trainer):
@@ -258,7 +261,8 @@ class RayPlugin(DDPSpawnPlugin):
         results = self.execution_loop(trainer, tune_enabled=False)
         return results
 
-    def post_dispatch(self):
+    # trainer param needed to accomodate API assumed by pytorch_lightning accelerators:
+    def post_dispatch(self, trainer):
         """Shutdown the DDP process group and all the Ray actors. """
 
         def shutdown_remote():
@@ -281,8 +285,8 @@ class RayPlugin(DDPSpawnPlugin):
         """Train/test/eval function to be executed on each remote worker."""
         assert isinstance(self, RayPlugin)
         # This method should be executed remotely in each worker.
-        self._model = model
-        self.lightning_module.trainer.accelerator_connector\
+        self.model = model
+        self.lightning_module.trainer._accelerator_connector\
             ._training_type_plugin = self
         self.lightning_module.trainer.accelerator.training_type_plugin = self
         self.cluster_environment.set_global_rank(global_rank)
@@ -296,17 +300,15 @@ class RayPlugin(DDPSpawnPlugin):
         # transfer_distrib_spawn_state_on_fit_end.
         # We override that method and have it just set attributes.
         # Then we can just return those attributes here.
-        super(RayPlugin, self).new_process(
-            process_idx=global_rank,
-            trainer=self.lightning_module.trainer,
-            mp_queue=None)
+        self.new_process(self.lightning_module.trainer)
+
         # Only need results from worker 0.
         if self.global_rank == 0:
             return self.results, self.best_model_path, self.model_state_stream
         else:
             return None
 
-    def init_ddp_connection(self,
+    def init_dist_connection(self,
                             global_rank: int,
                             world_size: int,
                             is_slurm_managing_tasks: bool = False) -> None:
@@ -341,8 +343,32 @@ class RayPlugin(DDPSpawnPlugin):
         else:
             return torch.device("cpu")
 
-    def transfer_distrib_spawn_state_on_fit_end(self, results):
+    def new_process(self, trainer: "pl.Trainer") -> None:
+
+        # move the model to the correct device
+        self.model_to_device()
+
+        if self.sync_batchnorm:
+            self.model = self.configure_sync_batchnorm(self.model)
+
+        # skip wrapping the model if we are not fitting as no gradients need to be exchanged
+        trainer_fn = self.lightning_module.trainer.state.fn
+        if trainer_fn == TrainerFn.FITTING:
+            self.configure_ddp()
+
+        self.barrier()
+
+        results = trainer.run_stage()
+
+        # persist info in ddp_spawn
+        self.__transfer_distrib_spawn_state_on_fit_end(trainer, results)
+
+        # ensure that spawned processes go through teardown before joining
+        trainer._call_teardown_hook()
+
+    def __transfer_distrib_spawn_state_on_fit_end(self, trainer, results):
         """Sets the training output as attributes so it can be retrieved."""
+
         if self.global_rank == 0:
             # Save training results as attributes.
             self._results = results

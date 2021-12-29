@@ -5,7 +5,6 @@ from pytorch_lightning.utilities import rank_zero_only
 
 import ray
 from ray import ObjectRef
-from ray.util import PublicAPI
 from ray.util.queue import Queue
 
 from ray_lightning.session import init_session
@@ -29,7 +28,6 @@ def get_executable_cls():
     return None
 
 
-@PublicAPI(stability="beta")
 class HorovodRayPlugin(HorovodPlugin):
     """Pytorch Lightning Plugin for Horovod training on a Ray cluster.
 
@@ -170,7 +168,7 @@ class HorovodRayPlugin(HorovodPlugin):
     def train_remote(self, model: ObjectRef, queue: Queue = None, **kwargs):
         """Training function to be executed on each remote worker."""
         self._model = ray.get(model)
-        self.lightning_module.trainer.accelerator_connector\
+        self.lightning_module.trainer._accelerator_connector\
             ._training_type_plugin = self
         self.lightning_module.trainer.accelerator.training_type_plugin = self
 

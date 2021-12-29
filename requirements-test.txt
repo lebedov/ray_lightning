@@ -8,4 +8,5 @@ pytorch-lightning==1.4.7
 lightning-bolts==0.3.3
 ray[tune]
 torch==1.8.1
+torchmetrics
 torchvision

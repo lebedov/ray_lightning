@@ -5,7 +5,6 @@ import fsspec
 import os
 
 from pytorch_lightning import Trainer, LightningModule
-from ray.util import PublicAPI
 
 from ray_lightning.session import put_queue, get_actor_rank
 from ray_lightning.util import to_state_stream, Unavailable
@@ -28,7 +27,6 @@ except ImportError:
 
 if TUNE_INSTALLED:
 
-    @PublicAPI(stability="beta")
     def get_tune_ddp_resources(
             num_workers: int = 1,
             num_cpus_per_worker: int = 1,
@@ -55,7 +53,6 @@ if TUNE_INSTALLED:
             bundles, strategy="PACK")
         return placement_group_factory
 
-    @PublicAPI(stability="beta")
     class TuneReportCallback(TuneCallback):
         """Distributed PyTorch Lightning to Ray Tune reporting callback
 
@@ -177,7 +174,6 @@ if TUNE_INSTALLED:
                 put_queue(lambda: self._create_checkpoint(
                     checkpoint_stream, global_step, self._filename))
 
-    @PublicAPI(stability="beta")
     class TuneReportCheckpointCallback(TuneCallback):
         """PyTorch Lightning to Tune reporting and checkpointing callback.
 

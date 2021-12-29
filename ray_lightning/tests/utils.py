@@ -3,7 +3,8 @@ from typing import Optional, List
 
 import torch
 import torch.nn.functional as F
-from pytorch_lightning.plugins import Plugin
+import torchmetrics as metrics
+from pytorch_lightning.plugins import TrainingTypePlugin
 from torch.utils.data import Dataset
 
 import pytorch_lightning as pl
@@ -106,7 +107,7 @@ class LightningMNISTClassifier(pl.LightningModule):
         self.layer_1 = torch.nn.Linear(28 * 28, layer_1)
         self.layer_2 = torch.nn.Linear(layer_1, layer_2)
         self.layer_3 = torch.nn.Linear(layer_2, 10)
-        self.accuracy = pl.metrics.Accuracy()
+        self.accuracy = metrics.Accuracy()
 
     def forward(self, x):
         batch_size, channels, width, height = x.size()
@@ -146,7 +147,7 @@ class LightningMNISTClassifier(pl.LightningModule):
 
 
 def get_trainer(dir,
-                plugins: List[Plugin],
+                plugins: List[TrainingTypePlugin],
                 use_gpu: bool = False,
                 max_epochs: int = 1,
                 limit_train_batches: int = 10,
@@ -198,7 +199,7 @@ def predict_test(trainer: Trainer, model: LightningModule,
     model = trainer.lightning_module
     dm.setup(stage="test")
     test_loader = dm.test_dataloader()
-    acc = pl.metrics.Accuracy()
+    acc = metrics.Accuracy()
     for batch in test_loader:
         x, y = batch
         with torch.no_grad():
